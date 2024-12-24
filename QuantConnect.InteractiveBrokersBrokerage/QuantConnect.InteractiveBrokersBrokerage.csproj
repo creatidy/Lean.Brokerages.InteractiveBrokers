@@ -2,7 +2,7 @@
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFramework>net9.0</TargetFramework>
     <Product>QuantConnect.Brokerages.InteractiveBrokers</Product>
     <AssemblyName>QuantConnect.Brokerages.InteractiveBrokers</AssemblyName>
     <RootNamespace>QuantConnect.Brokerages.InteractiveBrokers</RootNamespace>
@@ -31,7 +31,8 @@
 
   <ItemGroup>
 	  <PackageReference Include="QuantConnect.Brokerages" Version="2.5.*" />
-	  <PackageReference Include="QuantConnect.IBAutomater" Version="2.0.79">
+	  <PackageReference Include="QuantConnect.Lean.Engine" Version="2.5.*" />
+	  <PackageReference Include="QuantConnect.IBAutomater" Version="2.0.81">
 		  <!--
 		  Content files of dependencies are excluded by default.
 		  This allows content files to be available in project where nuget will be consumed.

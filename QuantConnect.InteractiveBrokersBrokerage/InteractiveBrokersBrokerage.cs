@@ -147,6 +147,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private readonly ConcurrentDictionary<int, StopLimitOrder> _preSubmittedStopLimitOrders = new();
 
+        /// <summary>
+        /// Provides a thread-safe service for caching and managing original orders when they are part of a group.
+        /// </summary>
+        private GroupOrderCacheManager _groupOrderCacheManager = new();
+
         // tracks requested order updates, so we can flag Submitted order events as updates
         private readonly ConcurrentDictionary<int, int> _orderUpdates = new ConcurrentDictionary<int, int>();
 
@@ -183,7 +188,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             { Market.CBOT, "CBOT" },
             { Market.ICE, "NYBOT" },
             { Market.CFE, "CFE" },
-            { Market.NYSELIFFE, "NYSELIFFE" }
+            { Market.NYSELIFFE, "NYSELIFFE" },
+            { Market.EUREX, "EUREX" }
         };
 
         private readonly SymbolPropertiesDatabase _symbolPropertiesDatabase = SymbolPropertiesDatabase.FromDataFolder();
@@ -1278,17 +1284,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             _client = new IB.InteractiveBrokersClient(_signal);
 
-            // set up event handlers
-            _client.UpdatePortfolio += HandlePortfolioUpdates;
-            _client.OrderStatus += HandleOrderStatusUpdates;
-            _client.OpenOrder += HandleOpenOrder;
-            _client.OpenOrderEnd += HandleOpenOrderEnd;
+            // running as a data provider only
+            if (_algorithm != null)
+            {
+                // set up event handlers
+                _client.UpdatePortfolio += HandlePortfolioUpdates;
+                _client.OrderStatus += HandleOrderStatusUpdates;
+                _client.OpenOrder += HandleOpenOrder;
+                _client.OpenOrderEnd += HandleOpenOrderEnd;
+                _client.ExecutionDetails += HandleExecutionDetails;
+                _client.CommissionReport += HandleCommissionReport;
+            }
             _client.UpdateAccountValue += HandleUpdateAccountValue;
             _client.AccountSummary += HandleAccountSummary;
             _client.ManagedAccounts += HandleManagedAccounts;
             _client.FamilyCodes += HandleFamilyCodes;
-            _client.ExecutionDetails += HandleExecutionDetails;
-            _client.CommissionReport += HandleCommissionReport;
             _client.Error += HandleError;
             _client.TickPrice += HandleTickPrice;
             _client.TickSize += HandleTickSize;
@@ -1338,13 +1348,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="exchange">The exchange to send the order to, defaults to "Smart" to use IB's smart routing</param>
         private void IBPlaceOrder(Order order, bool needsNewId, string exchange = null)
         {
-            if (!order.TryGetGroupOrders(TryGetOrder, out var orders))
+            if (!_groupOrderCacheManager.TryGetGroupCachedOrders(order, out var orders))
             {
-                // some order of the group is missing but cache the new one
-                CacheOrder(order);
                 return;
             }
-            RemoveCachedOrders(orders);
 
             // MOO/MOC require directed option orders.
             // We resolve non-equity markets in the `CreateContract` method.
@@ -1536,7 +1543,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="ticker">The associated Lean ticker. Just used for logging, can be provided empty</param>
         private ContractDetails GetContractDetails(Contract contract, string ticker, bool failIfNotFound = true)
         {
-            if (_contractDetails.TryGetValue(GetUniqueKey(contract), out var details))
+            if (contract.SecType != null && _contractDetails.TryGetValue(GetUniqueKey(contract), out var details))
             {
                 return details;
             }
@@ -3424,7 +3431,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // Handle future options as a Future, up until we actually return the future.
                 if (isFutureOption || securityType == SecurityType.Future)
                 {
-                    var leanSymbol = _symbolMapper.GetLeanRootSymbol(ibSymbol);
+                    var leanSymbol = _symbolMapper.GetLeanRootSymbol(ibSymbol, securityType);
                     var defaultMarket = market;
 
                     if (!_symbolPropertiesDatabase.TryGetMarket(leanSymbol, SecurityType.Future, out market))
@@ -3525,7 +3532,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var tradingMode = job.BrokerageData["ib-trading-mode"];
             var agentDescription = job.BrokerageData["ib-agent-description"];
 
-            var loadExistingHoldings = true;
+            var loadExistingHoldings = Config.GetBool("load-existing-holdings", true);
             if (job.BrokerageData.ContainsKey("load-existing-holdings"))
             {
                 loadExistingHoldings = Convert.ToBoolean(job.BrokerageData["load-existing-holdings"]);
@@ -3631,6 +3638,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             // we ignore futures canonical symbol
                             if (symbol.ID.SecurityType == SecurityType.Future && symbol.IsCanonical())
                             {
+                                continue;
+                            }
+
+                            // Skip subscribing to expired option contracts
+                            if (OptionSymbol.IsOptionContractExpired(symbol, DateTime.UtcNow))
+                            {
+                                Log.Trace($"InteractiveBrokersBrokerage.Subscribe(): Skipping subscription for {symbol} because the contract has expired.");
                                 continue;
                             }
 
@@ -3773,7 +3787,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 (securityType == SecurityType.Forex && market == Market.Oanda) ||
                 (securityType == SecurityType.Option && market == Market.USA) ||
                 (securityType == SecurityType.IndexOption && market == Market.USA) ||
-                (securityType == SecurityType.Index && market == Market.USA) ||
+                (securityType == SecurityType.Index && (market == Market.USA || market == Market.EUREX)) ||
                 (securityType == SecurityType.FutureOption) ||
                 (securityType == SecurityType.Future) ||
                 (securityType == SecurityType.Cfd && market == Market.InteractiveBrokers);
@@ -4058,7 +4072,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             // setting up lookup request
             var contract = new Contract
             {
-                Symbol = _symbolMapper.GetBrokerageRootSymbol(lookupName),
+                Symbol = _symbolMapper.GetBrokerageRootSymbol(lookupName, symbol.SecurityType),
                 Currency = securityCurrency ?? symbolProperties.QuoteCurrency,
                 Exchange = exchangeSpecifier,
                 SecType = ConvertSecurityType(symbol.SecurityType),
@@ -4966,29 +4980,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private void HandleManagedAccounts(object sender, IB.ManagedAccountsEventArgs e)
         {
             Log.Trace($"InteractiveBrokersBrokerage.HandleManagedAccounts(): Account list: {e.AccountList}");
-        }
-
-        /// <summary>
-        /// We cache the original orders when they are part of a group. We don't ask the order provider because we would get a clone
-        /// and we want to be able to modify the original setting the brokerage id
-        /// </summary>
-        private Order TryGetOrder(int orderId)
-        {
-            _pendingGroupOrders.TryGetValue(orderId, out var order);
-            return order;
-        }
-
-        private void CacheOrder(Order order)
-        {
-            _pendingGroupOrders[order.Id] = order;
-        }
-
-        private void RemoveCachedOrders(List<Order> orders)
-        {
-            for (var i = 0; i < orders.Count; i++)
-            {
-                _pendingGroupOrders.TryRemove(orders[i].Id, out _);
-            }
         }
 
         private void AddGuaranteedTag(IBApi.Order ibOrder, bool nonGuaranteed)
