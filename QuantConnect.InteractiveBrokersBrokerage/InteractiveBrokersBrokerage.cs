@@ -184,7 +184,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private ConcurrentDictionary<long, Contract> _comboOrdersContracts = new();
 
         // Prioritized list of exchanges used to find right futures contract
-        private readonly Dictionary<string, string> _futuresExchanges = new Dictionary<string, string>
+        private static readonly Dictionary<string, string> _futuresExchanges = new Dictionary<string, string>
         {
             { Market.CME, "CME" },
             { Market.NYMEX, "NYMEX" },
@@ -196,7 +196,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             { Market.EUREX, "EUREX" }
         };
 
-        private readonly SymbolPropertiesDatabase _symbolPropertiesDatabase = SymbolPropertiesDatabase.FromDataFolder();
+        private static readonly SymbolPropertiesDatabase _symbolPropertiesDatabase = SymbolPropertiesDatabase.FromDataFolder();
 
         // exchange time zones by symbol
         private readonly Dictionary<Symbol, DateTimeZone> _symbolExchangeTimeZones = new Dictionary<Symbol, DateTimeZone>();
@@ -236,6 +236,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _historyOpenInterestWarning;
         private bool _historyCfdTradeWarning;
         private bool _historyInvalidPeriodWarning;
+
+        // Symbols that IB doesn't support ("No security definition has been found for the request")
+        // We keep track of them to avoid flooding the logs with the same error/warning
+        private readonly HashSet<string> _unsupportedAssets = new();
 
         /// <summary>
         /// Represents the next local market open time after which the first 'lastPrice' tick for the NDX index should be skipped.
@@ -1661,7 +1665,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="price">Price to be normalized</param>
         /// <param name="symbol">Symbol from which we need to get the PriceMagnifier attribute to normalize the price</param>
         /// <returns>The price normalized to LEAN expected unit</returns>
-        private decimal NormalizePriceToLean(double price, Symbol symbol)
+        public static decimal NormalizePriceToLean(double price, Symbol symbol)
+        {
+            return NormalizePriceToLean(Convert.ToDecimal(price), symbol);
+        }
+
+        /// <summary>
+        /// Helper method to normalize a provided price to the Lean expected unit
+        /// </summary>
+        /// <param name="price">Price to be normalized</param>
+        /// <param name="symbol">Symbol from which we need to get the PriceMagnifier attribute to normalize the price</param>
+        /// <returns>The price normalized to LEAN expected unit</returns>
+        public static decimal NormalizePriceToLean(decimal price, Symbol symbol)
         {
             var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol, symbol.SecurityType, Currencies.USD);
             return Convert.ToDecimal(price) / symbolProperties.PriceMagnifier;
@@ -1676,7 +1691,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="symbol">The symbol from which we need to get the PriceMagnifier attribute to normalize the price</param>
         /// <param name="minTick">The minimum allowed price variation</param>
         /// <returns>The price normalized to be brokerage expected unit</returns>
-        private double NormalizePriceToBrokerage(decimal price, Contract contract, Symbol symbol, decimal? minTick = null)
+        public double NormalizePriceToBrokerage(decimal price, Contract contract, Symbol symbol, decimal? minTick = null)
         {
             var symbolProperties = _symbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol, symbol.SecurityType, Currencies.USD);
             var roundedPrice = RoundPrice(price, minTick ?? GetMinTick(contract, symbol.Value));
@@ -1892,6 +1907,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     else if (requestInfo.RequestType == RequestType.SoftContractDetails)
                     {
                         return;
+                    }
+                    else if (_algorithm != null && _algorithm.Settings.IgnoreUnknownAssetHoldings)
+                    {
+                        // Let's make it a one time warning, we don't want to flood the logs with this message
+                        if (requestInfo?.AssociatedSymbol != null)
+                        {
+                            lock (_unsupportedAssets)
+                            {
+                                if (!_unsupportedAssets.Add($"{requestInfo.AssociatedSymbol.Value}-{requestInfo.AssociatedSymbol.SecurityType}"))
+                                {
+                                    return;
+                                }
+                            }
+                        }
+
+                        brokerageMessageType = BrokerageMessageType.Warning;
                     }
                 }
             }
@@ -2529,8 +2560,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     // because after the user has manually closed the position and restarted the algorithm,
                     // he'll have a zero position but a nonzero realized PNL, so this event handler will be called again.
 
-                    _accountHoldingsLastException = exception;
-                    _accountHoldingsResetEvent.Set();
+                    if (_algorithm == null || !_algorithm.Settings.IgnoreUnknownAssetHoldings)
+                    {
+                        _accountHoldingsLastException = exception;
+                        _accountHoldingsResetEvent.Set();
+                    }
+                    else
+                    {
+                        CheckContractConversionError(exception, e.Contract, rethrow: false);
+                    }
                 }
             }
         }
@@ -2764,17 +2802,63 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     {
                         legLimitPrice = ibOrder.OrderComboLegs[i].Price;
                     }
-                    result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType,
-                        comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, 0, 0, contractDetails.Contract, group, orderState));
+
+                    if (!TryConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, orderType,
+                            comboLeg.Ratio * quantitySignLeg * quantity, legLimitPrice, 0, 0, contractDetails.Contract, group, orderState,
+                            out var leanOrder))
+                    {
+                        // if we fail to convert one leg, we fail the whole order
+                        return new List<Order>();
+                    }
+
+                    result.Add(leanOrder);
                 }
             }
-            else
+            else if (TryConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity,
+                ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null, orderState, out var leanOrder))
             {
-                result.Add(ConvertOrder(ibOrder.Tif, ibOrder.GoodTillDate, ibOrder.OrderId, ibOrder.AuxPrice, ConvertOrderType(ibOrder), quantity,
-                    ibOrder.LmtPrice, ibOrder.TrailStopPrice, ibOrder.TrailingPercent, contract, null, orderState));
+                result.Add(leanOrder);
             }
 
             return result;
+        }
+
+        private void CheckContractConversionError(Exception exception, Contract contract, bool rethrow = true)
+        {
+            var notSupportedException = exception as NotSupportedException;
+            notSupportedException ??= exception.InnerException as NotSupportedException;
+            if (notSupportedException != null && _algorithm.Settings.IgnoreUnknownAssetHoldings)
+            {
+                lock (_unsupportedAssets)
+                {
+                    if (contract == null || _unsupportedAssets.Add($"{contract.Symbol}-{contract.SecType}"))
+                    {
+                        OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "ConvertOrders", notSupportedException.Message));
+                    }
+                }
+            }
+            else if (rethrow)
+            {
+                throw exception;
+            }
+        }
+
+        private bool TryConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
+            double limitPrice, double trailingStopPrice, double trailingPercentage, Contract contract, GroupOrderManager groupOrderManager, OrderState orderState,
+            out Order leanOrder)
+        {
+            try
+            {
+                leanOrder = ConvertOrder(timeInForce, goodTillDate, ibOrderId, auxPrice, orderType, quantity,
+                    limitPrice, trailingStopPrice, trailingPercentage, contract, groupOrderManager, orderState);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                leanOrder = null;
+                CheckContractConversionError(ex, contract);
+                return false;
+            }
         }
 
         private Order ConvertOrder(string timeInForce, string goodTillDate, int ibOrderId, double auxPrice, OrderType orderType, decimal quantity,
@@ -3055,7 +3139,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Maps OrderDirection enumeration
         /// </summary>
-        private OrderDirection ConvertOrderDirection(string direction)
+        public static OrderDirection ConvertOrderDirection(string direction)
         {
             switch (direction)
             {
@@ -3157,7 +3241,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
         }
 
-        private static DateTime ParseExpiryDateTime(string expiryDateTime)
+        public static DateTime ParseExpiryDateTime(string expiryDateTime)
         {
             // NOTE: we currently ignore the time zone in this method for a couple of reasons:
             // - TZ abbreviations are ambiguous and unparsable to a unique time zone
@@ -3221,7 +3305,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Maps IB's OrderStats enum
         /// </summary>
-        private static OrderStatus ConvertOrderStatus(string status)
+        public static OrderStatus ConvertOrderStatus(string status)
         {
             switch (status)
             {
@@ -3265,7 +3349,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Maps SecurityType enum to an IBApi SecurityType value
         /// </summary>
-        private static string ConvertSecurityType(SecurityType type)
+        public static string ConvertSecurityType(SecurityType type)
         {
             switch (type)
             {
@@ -3301,13 +3385,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private static SecurityType ConvertSecurityType(Contract contract)
         {
-            switch (contract.SecType)
+            return ConvertSecurityType(contract.SecType, contract.Symbol, GetContractDescription(contract));
+        }
+
+        /// <summary>
+        /// Maps SecurityType enum
+        /// </summary>
+        public static SecurityType ConvertSecurityType(string securityType, string ticker, string error = null)
+        {
+            switch (securityType)
             {
                 case IB.SecurityType.Stock:
                     return SecurityType.Equity;
 
                 case IB.SecurityType.Option:
-                    return IndexOptionSymbol.IsIndexOption(contract.Symbol)
+                    return IndexOptionSymbol.IsIndexOption(ticker)
                         ? SecurityType.IndexOption
                         : SecurityType.Option;
 
@@ -3328,7 +3420,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                 default:
                     throw new NotSupportedException(
-                        $"An existing position or open order for an unsupported security type was found: {GetContractDescription(contract)}. " +
+                        $"An existing position or open order for an unsupported security type was found: {error ?? $"{securityType} {ticker}"}. " +
                         "Please manually close the position or cancel the order before restarting the algorithm.");
             }
         }
@@ -4606,10 +4698,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="securityType">SecurityType of the Symbol</param>
         /// <param name="market">Market of the Symbol</param>
         /// <param name="ticker">Ticker for the symbol</param>
-        private string GetSymbolExchange(SecurityType securityType, string market, string ticker = null)
+        public static string GetSymbolExchange(SecurityType securityType, string market)
         {
             switch (securityType)
             {
+                case SecurityType.Forex:
+                    return "IDEALPRO"; // IB's Forex market is always IDEALPRO
                 case SecurityType.Option:
                 case SecurityType.IndexOption:
                     // Regular equity options uses default, in this case "Smart"
@@ -4635,7 +4729,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="symbol">Symbol to route</param>
         private string GetSymbolExchange(Symbol symbol)
         {
-            return GetSymbolExchange(symbol.SecurityType, symbol.ID.Market, symbol.ID.Symbol);
+            return GetSymbolExchange(symbol.SecurityType, symbol.ID.Market);
         }
 
         /// <summary>
