@@ -43,6 +43,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         // We fix this: We map those tickers back to their original names using the map below
         private readonly Dictionary<SecurityType, Dictionary<string, string>> _ibNameMap = new Dictionary<SecurityType, Dictionary<string, string>>();
 
+        // lean uses dots for ticker suffixes, which are mapped to spaces because IB uses spaces for suffixes.
+        // There are also a few cases where IB uses dots in equity tickers for other purposes (e.g. AGLE.CNT).
+        // In those cases we make sure we don't replace dots with spaces when converting from Lean to IB symbols.
+        private static HashSet<string> _ibEquityTickersWithDot = new();
+
         /// <summary>
         /// Constructs InteractiveBrokersSymbolMapper. Default parameters are used.
         /// </summary>
@@ -161,7 +166,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                     case SecurityType.FutureOption:
                         var future = FuturesOptionsUnderlyingMapper.GetUnderlyingFutureFromFutureOption(
-                            GetLeanRootSymbol(ticker, securityType),
+                            ticker,
                             market,
                             expirationDate,
                             DateTime.Now);
@@ -199,7 +204,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         public string GetBrokerageRootSymbol(string rootSymbol, SecurityType securityType)
         {
             var brokerageSymbol = rootSymbol;
-            if (_ibNameMap.TryGetValue(securityType, out var symbolMap))
+            if (TryGetSymbolMap(securityType, out var symbolMap))
             {
                 brokerageSymbol = symbolMap.FirstOrDefault(kv => kv.Value == rootSymbol).Key;
             }
@@ -214,11 +219,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns></returns>
         public string GetLeanRootSymbol(string brokerageRootSymbol, SecurityType securityType)
         {
-            var ticker = _ibNameMap.TryGetValue(securityType, out var symbolMap) && symbolMap.TryGetValue(brokerageRootSymbol, out var rootSymbol)
+            var isEquityOrOption = securityType == SecurityType.Equity || securityType == SecurityType.Option;
+            if (isEquityOrOption && brokerageRootSymbol.Contains('.'))
+            {
+                _ibEquityTickersWithDot.Add(brokerageRootSymbol);
+            }
+
+            var ticker = TryGetSymbolMap(securityType, out var symbolMap) && symbolMap.TryGetValue(brokerageRootSymbol, out var rootSymbol)
                 ? rootSymbol
                 : brokerageRootSymbol;
 
-            if (securityType == SecurityType.Equity || securityType == SecurityType.Option || securityType == SecurityType.Cfd)
+            if (isEquityOrOption || securityType == SecurityType.Cfd)
             {
                 ticker = ticker.Replace(" ", ".");
             }
@@ -288,7 +299,12 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             if (symbol.ID.SecurityType == SecurityType.Equity)
             {
                 var mapFile = _mapFileProvider.Get(AuxiliaryDataKey.Create(symbol)).ResolveMapFile(symbol);
-                ticker = mapFile.GetMappedSymbol(DateTime.UtcNow, symbol.Value).Replace(".", " ");
+                ticker = mapFile.GetMappedSymbol(DateTime.UtcNow, symbol.Value);
+
+                if (!_ibEquityTickersWithDot.Contains(ticker))
+                {
+                    ticker = ticker.Replace(".", " ");
+                }
             }
             else if (symbol.SecurityType == SecurityType.Cfd)
             {
@@ -345,6 +361,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 IncludeExpired = false,
                 Currency = malformedContract.Currency
             };
+        }
+
+        /// <summary>
+        /// Gets the symbol mapper for the given security type.
+        /// If security type is an option type and no map is found for it, it tries to get the map for its underlying security type.
+        /// </summary>
+        private bool TryGetSymbolMap(SecurityType securityType, out Dictionary<string, string> symbolMap)
+        {
+            return _ibNameMap.TryGetValue(securityType, out symbolMap) ||
+                (securityType.IsOption() && _ibNameMap.TryGetValue(Symbol.GetUnderlyingFromOptionType(securityType), out symbolMap));
         }
     }
 }
