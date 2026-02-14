@@ -23,7 +23,7 @@
     <OutputPath>bin\Release\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\..\Lean\Common\Properties\SharedAssemblyInfo.cs" Link="Properties\SharedAssemblyInfo.cs" />
+    <Compile Include="..\..\Common\Properties\SharedAssemblyInfo.cs" Link="Properties\SharedAssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
@@ -40,8 +40,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\Lean\Brokerages\QuantConnect.Brokerages.csproj" />
-    <ProjectReference Include="..\..\Lean\Engine\QuantConnect.Lean.Engine.csproj" />
+    <ProjectReference Include="..\..\Brokerages\QuantConnect.Brokerages.csproj" />
+    <ProjectReference Include="..\..\Engine\QuantConnect.Lean.Engine.csproj" />
   </ItemGroup>
 
   <ItemGroup>
