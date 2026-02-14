@@ -965,6 +965,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.AreEqual(expectedCount, result.Count);
         }
 
+        private static IEnumerable<TestCaseData> LongRangeHistoricalDataTestCases()
+        {
+            yield return new TestCaseData(Symbols.AAPL, Resolution.Daily, new DateTime(1979, 06, 01), new DateTime(2025, 12, 30, 16, 0, 0), false);
+            yield return new TestCaseData(Symbols.AAPL, Resolution.Hour, new DateTime(1979, 06, 01), new DateTime(2025, 12, 30, 16, 0, 0), false);
+
+            var aud = Symbols.CreateFutureSymbol(Futures.Currencies.AUD, new(2026, 01, 16));
+            // the starting trade of 6A 2026/01/16 is on 2025/08/19
+            yield return new TestCaseData(aud, Resolution.Daily, new DateTime(2025, 06, 01), new DateTime(2025, 12, 30, 16, 0, 0), false);
+            yield return new TestCaseData(aud, Resolution.Hour, new DateTime(2025, 8, 17, 16, 0, 0), new DateTime(2025, 8, 20, 16, 0, 0), true);
+            yield return new TestCaseData(aud, Resolution.Daily, new DateTime(2025, 8, 17, 16, 0, 0), new DateTime(2025, 8, 20, 16, 0, 0), false);
+            // 2025/08/23 - Saturday, 2025/08/24 - Sunday
+            yield return new TestCaseData(aud, Resolution.Daily, new DateTime(2025, 8, 23, 9, 0, 0), new DateTime(2025, 8, 24, 16, 0, 0), true).SetDescription("Weekend");
+        }
+
+        [TestCaseSource(nameof(LongRangeHistoricalDataTestCases))]
+        public void GetsHistoricalDataForExtendedDateRanges(Symbol symbol, Resolution resolution, DateTime startDate, DateTime endDate, bool isEmpty)
+        {
+            Log.DebuggingEnabled = true;
+            var tz = TimeZones.NewYork;
+
+            var backwardsTs = endDate - startDate;
+            var result = GetHistory(symbol, resolution, tz, tz, endDate, backwardsTs, includeExtendedMarketHours: false);
+
+            Assert.AreEqual(result.Count == 0, isEmpty);
+        }
+
+        [TestCase("120 S", 120)]
+        [TestCase("1 D", 86400)]
+        [TestCase("1 M", 31 * 86400, Description = "Jan => Feb (2024/01/01 => 2024/02/01)")]
+        [TestCase("1 Y", 366 * 86400, Description = "referenceUtc: 2024 is a leap year")]
+        public void ParseDurationReturnsExpectedTimeSpan(string duration, int expectedSeconds)
+        {
+            var referenceUtc = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var result = InteractiveBrokersBrokerage.ParseDuration(duration, referenceUtc);
+
+            Assert.AreEqual(TimeSpan.FromSeconds(expectedSeconds), result);
+        }
+
+        [TestCase("0 D")]
+        [TestCase("-5 S")]
+        [TestCase("0 M")]
+        [TestCase("abc")]
+        [TestCase("")]
+        [TestCase("10 W", Description = "Unsupported duration ib unit")]
+        public void ParseDurationReturnsOneDayWhenInvalidOrNonPositive(string duration)
+        {
+            var referenceUtc = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var result = InteractiveBrokersBrokerage.ParseDuration(duration, referenceUtc);
+
+            Assert.AreEqual(TimeSpan.FromDays(1), result);
+        }
+
         [Test]
         public void IgnoresSecurityNotFoundErrorOnExpiredContractsHistoricalRequests()
         {
@@ -1127,13 +1179,13 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             get
             {
                 yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T15:59:59.900", false, 0).SetDescription("Summer EDT - Before safe window - no wait");
-                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:00.000", true, 5000).SetDescription("Summer EDT - Exactly at boundary - should wait");
-                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:00.400", true, 4600).SetDescription("Summer EDT - Within safe buffer - should wait");
-                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:05.000", false, 0).SetDescription("Summer EDT - After safe window - no wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:00.000", true, 10000).SetDescription("Summer EDT - Exactly at boundary - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:00.400", true, 9600).SetDescription("Summer EDT - Within safe buffer - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-07-15T16:00:10.000", false, 0).SetDescription("Summer EDT - After safe window - no wait");
                 yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T15:59:59.900", false, 0).SetDescription("Winter EST - Before safe window - no wait");
-                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:00.000", true, 5000).SetDescription("Winter EST - Exactly at boundary - should wait");
-                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:00.400", true, 4600).SetDescription("Winter EST - Within safe buffer - should wait");
-                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:05.000", false, 0).SetDescription("Winter EST - After safe window - no wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:00.000", true, 10000).SetDescription("Winter EST - Exactly at boundary - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:00.400", true, 9600).SetDescription("Winter EST - Within safe buffer - should wait");
+                yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-01-15T16:00:10.000", false, 0).SetDescription("Winter EST - After safe window - no wait");
                 yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-09-05T20:00:00.000", false, 0).SetDescription("Friday after regular market hours");
                 yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-09-18T08:00:00.000", false, 0);
                 yield return new TestCaseData(Symbols.AAPL, OrderType.MarketOnOpen, "2025-09-18T08:29:00.000", false, 0);
@@ -1606,6 +1658,58 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
                 return [null, underlying2, underlying];
             }
             throw new NotImplementedException();
+        }
+
+        [Test]
+        public void HandleErrorCompetingLiveSessionIsThrottled()
+        {
+            using var brokerage = GetBrokerage();
+            const int invocationCount = 5;
+            var messageInvocationCount = 0;
+
+            void OnMessage(object _, BrokerageMessageEvent message)
+            {
+                if (message.Code == IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode.ToString())
+                {
+                    messageInvocationCount++;
+                }
+            }
+
+            Assert.IsTrue(brokerage.IsConnected);
+
+            brokerage.Message += OnMessage;
+
+            for (var i = 0; i < invocationCount; i++)
+            {
+                var errorEvent = new IB.ErrorEventArgs(
+                    id: 1,
+                    time: 0,
+                    code: IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode,
+                    message: "No market data during competing live session. Origin: [Id=5] Subscribe: SPY (STK SPY USD Smart ARCA  0 )");
+
+                brokerage.HandleError(this, errorEvent);
+            }
+
+            brokerage.Message -= OnMessage;
+
+            Assert.That(messageInvocationCount, Is.EqualTo(1));
+        }
+
+        [Test]
+        public void HandleEmitsOnlyOnceWithinThrottleInterval()
+        {
+            var emittedCount = 0;
+            var handler = new IB.CompetingLiveSessionMarketDataErrorHandler(_ => emittedCount++);
+            var now = DateTime.UtcNow;
+
+            for (var i = 0; i < 5; i++)
+            {
+                handler.Handle(now, IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode, "Test message");
+            }
+
+            Assert.AreEqual(1, emittedCount, "Handler should throttle repeated messages within interval");
+            handler.Handle(now.AddMinutes(15).AddSeconds(1), IB.CompetingLiveSessionMarketDataErrorHandler.ErrorCode, "Test message 2");
+            Assert.AreEqual(2, emittedCount, "Handler should emit again after throttle interval");
         }
     }
 }
